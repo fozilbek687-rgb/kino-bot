@@ -1,0 +1,345 @@
+import asyncio
+import logging
+import os
+from dataclasses import dataclass
+
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# Majburiy kanallar. Yangi kanal qo'shish uchun ro'yxatga yozing: ["@kanal1", "@kanal2"]
+DEFAULT_CHANNELS = ["@kino_20227"]
+
+
+def read_channels() -> tuple:
+    raw = os.getenv("CHANNELS") or os.getenv("CHANNEL") or ""
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return tuple(items) if items else tuple(DEFAULT_CHANNELS)
+
+
+@dataclass(frozen=True)
+class Config:
+    token: str = "9228102609:AAFoiGix4ovzRzisZDGi2R_TSIzinyUa8k8"
+    admins: frozenset = frozenset({7417150967})
+    channels: tuple = read_channels()
+    db_path: str = "kino.db"
+
+
+cfg = Config()
+router = Router()
+
+T = {
+    "uz": {
+        "welcome": "🎬 Kino kodini yoki nomini yozing.",
+        "not_found": "😕 Hech narsa topilmadi. Kod yoki boshqa nom yozib ko'ring.",
+        "need_sub": "📢 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling, so'ng «Tekshirish» tugmasini bosing:",
+        "check_btn": "✅ Tekshirish",
+        "not_sub": "Hali hamma kanallarga obuna bo'lmagansiz.",
+        "results": "🔎 Topilgan kinolar:",
+        "caption": "🎬 <b>{title}</b>\n🔑 Kod: <code>{code}</code>",
+    },
+    "ru": {
+        "welcome": "🎬 Введите код или название фильма.",
+        "not_found": "😕 Ничего не найдено. Попробуйте другой код или название.",
+        "need_sub": "📢 Чтобы пользоваться ботом, подпишитесь на каналы ниже и нажмите «Проверить»:",
+        "check_btn": "✅ Проверить",
+        "not_sub": "Вы подписались не на все каналы.",
+        "results": "🔎 Найденные фильмы:",
+        "caption": "🎬 <b>{title}</b>\n🔑 Код: <code>{code}</code>",
+    },
+    "en": {
+        "welcome": "🎬 Send a movie code or title.",
+        "not_found": "😕 Nothing found. Try another code or title.",
+        "need_sub": "📢 To use the bot, subscribe to the channels below, then tap “Check”:",
+        "check_btn": "✅ Check",
+        "not_sub": "You haven't subscribed to all channels yet.",
+        "results": "🔎 Movies found:",
+        "caption": "🎬 <b>{title}</b>\n🔑 Code: <code>{code}</code>",
+    },
+}
+LANGS = {"uz": "🇺🇿 O'zbekcha", "ru": "🇷🇺 Русский", "en": "🇬🇧 English"}
+
+
+class LangCb(CallbackData, prefix="lang"):
+    code: str
+
+
+class MovieCb(CallbackData, prefix="mv"):
+    id: int
+
+
+class CheckCb(CallbackData, prefix="chk"):
+    pass
+
+
+class Add(StatesGroup):
+    video = State()
+    title = State()
+
+
+async def init_db() -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY, lang TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS movies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                file_id TEXT NOT NULL, kind TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0);
+            """
+        )
+        await db.commit()
+
+
+async def q_one(sql: str, args: tuple = ()):
+    async with aiosqlite.connect(cfg.db_path) as db:
+        async with db.execute(sql, args) as cur:
+            return await cur.fetchone()
+
+
+async def q_all(sql: str, args: tuple = ()):
+    async with aiosqlite.connect(cfg.db_path) as db:
+        async with db.execute(sql, args) as cur:
+            return await cur.fetchall()
+
+
+async def run(sql: str, args: tuple = ()) -> int:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute(sql, args)
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_lang(uid: int) -> str:
+    row = await q_one("SELECT lang FROM users WHERE user_id=?", (uid,))
+    return row[0] if row else "uz"
+
+
+def kb_lang() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for code, label in LANGS.items():
+        b.button(text=label, callback_data=LangCb(code=code))
+    b.adjust(3)
+    return b.as_markup()
+
+
+async def missing_channels(bot: Bot, uid: int) -> list:
+    """Foydalanuvchi obuna bo'lmagan kanallar ro'yxati."""
+    if uid in cfg.admins:
+        return []
+    missing = []
+    for ch in cfg.channels:
+        try:
+            m = await bot.get_chat_member(ch, uid)
+            if m.status in ("left", "kicked"):
+                missing.append(ch)
+        except Exception:
+            logging.warning("%s tekshirib bo'lmadi (bot kanalda admin emasmi?)", ch)
+    return missing
+
+
+def kb_subscribe(lang: str, missing: list) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for ch in missing:
+        b.button(text=f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")
+    b.button(text=T[lang]["check_btn"], callback_data=CheckCb())
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def gate(bot: Bot, message: Message, uid: int, lang: str) -> bool:
+    """True bo'lsa, davom etish mumkin. Aks holda obuna so'raladi."""
+    missing = await missing_channels(bot, uid)
+    if not missing:
+        return True
+    await message.answer(T[lang]["need_sub"], reply_markup=kb_subscribe(lang, missing))
+    return False
+
+
+async def send_movie(message: Message, movie_id: int, lang: str) -> bool:
+    row = await q_one("SELECT title, file_id, kind FROM movies WHERE id=?", (movie_id,))
+    if not row:
+        return False
+    title, file_id, kind = row
+    caption = T[lang]["caption"].format(title=title, code=movie_id)
+    if kind == "video":
+        await message.answer_video(file_id, caption=caption)
+    else:
+        await message.answer_document(file_id, caption=caption)
+    await run("UPDATE movies SET views=views+1 WHERE id=?", (movie_id,))
+    return True
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    uid = message.from_user.id
+    if not await q_one("SELECT 1 FROM users WHERE user_id=?", (uid,)):
+        return await message.answer(
+            "Tilni tanlang / Выберите язык / Choose language:", reply_markup=kb_lang())
+    lang = await get_lang(uid)
+    if await gate(bot, message, uid, lang):
+        await message.answer(T[lang]["welcome"])
+
+
+@router.callback_query(LangCb.filter())
+async def on_lang(call: CallbackQuery, callback_data: LangCb, bot: Bot) -> None:
+    lang = callback_data.code if callback_data.code in T else "uz"
+    uid = call.from_user.id
+    await run(
+        "INSERT INTO users (user_id, lang) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+        (uid, lang),
+    )
+    missing = await missing_channels(bot, uid)
+    if missing:
+        await call.message.edit_text(T[lang]["need_sub"], reply_markup=kb_subscribe(lang, missing))
+    else:
+        await call.message.edit_text(T[lang]["welcome"])
+    await call.answer()
+
+
+@router.callback_query(CheckCb.filter())
+async def on_check(call: CallbackQuery, bot: Bot) -> None:
+    uid = call.from_user.id
+    lang = await get_lang(uid)
+    missing = await missing_channels(bot, uid)
+    if missing:
+        await call.answer(T[lang]["not_sub"], show_alert=True)
+    else:
+        await call.message.edit_text(T[lang]["welcome"])
+        await call.answer()
+
+
+@router.callback_query(MovieCb.filter())
+async def on_pick(call: CallbackQuery, callback_data: MovieCb, bot: Bot) -> None:
+    uid = call.from_user.id
+    lang = await get_lang(uid)
+    if await gate(bot, call.message, uid, lang):
+        await send_movie(call.message, callback_data.id, lang)
+    await call.answer()
+
+
+def is_admin(message: Message) -> bool:
+    return message.from_user.id in cfg.admins
+
+
+@router.message(Command("add"))
+async def cmd_add(message: Message, state: FSMContext) -> None:
+    if not is_admin(message):
+        return
+    await state.set_state(Add.video)
+    await message.answer("🎞 Kinoni (video yoki fayl) yuboring. Bekor qilish: /start")
+
+
+@router.message(Add.video, F.video | F.document)
+async def add_video(message: Message, state: FSMContext) -> None:
+    if not is_admin(message):
+        return
+    if message.video:
+        await state.update_data(file_id=message.video.file_id, kind="video")
+    else:
+        await state.update_data(file_id=message.document.file_id, kind="document")
+    await state.set_state(Add.title)
+    await message.answer("✏️ Kino nomini yozing (masalan: Titanik 1997):")
+
+
+@router.message(Add.title, F.text)
+async def add_title(message: Message, state: FSMContext) -> None:
+    if not is_admin(message):
+        return
+    data = await state.get_data()
+    movie_id = await run(
+        "INSERT INTO movies (title, file_id, kind) VALUES (?,?,?)",
+        (message.text.strip(), data["file_id"], data["kind"]),
+    )
+    await state.clear()
+    await message.answer(f"✅ Qo'shildi. Kino kodi: <code>{movie_id}</code>")
+
+
+@router.message(Command("del"))
+async def cmd_del(message: Message) -> None:
+    if not is_admin(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Foydalanish: /del 125")
+    await run("DELETE FROM movies WHERE id=?", (int(parts[1]),))
+    await message.answer("🗑 O'chirildi.")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    if not is_admin(message):
+        return
+    users = (await q_one("SELECT COUNT(*) FROM users"))[0]
+    movies = (await q_one("SELECT COUNT(*) FROM movies"))[0]
+    views = (await q_one("SELECT COALESCE(SUM(views),0) FROM movies"))[0]
+    await message.answer(f"👥 Foydalanuvchilar: {users}\n🎬 Kinolar: {movies}\n👁 Ko'rishlar: {views}")
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def on_text(message: Message, bot: Bot) -> None:
+    uid = message.from_user.id
+    lang = await get_lang(uid)
+    if not await gate(bot, message, uid, lang):
+        return
+
+    text = message.text.strip()
+    if text.isdigit() and await send_movie(message, int(text), lang):
+        return
+
+    rows = await q_all(
+        "SELECT id, title FROM movies WHERE title LIKE ? ORDER BY views DESC LIMIT 10",
+        (f"%{text}%",),
+    )
+    if not rows:
+        return await message.answer(T[lang]["not_found"])
+    b = InlineKeyboardBuilder()
+    for mid, title in rows:
+        b.button(text=f"{title} ({mid})", callback_data=MovieCb(id=mid))
+    b.adjust(1)
+    await message.answer(T[lang]["results"], reply_markup=b.as_markup())
+
+
+# Veb-server (UptimeRobot uchun)
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    if not cfg.token:
+        raise SystemExit("BOT_TOKEN o'rnatilmagan")
+    await init_db()
+    
+    bot = Bot(cfg.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    # Bot polling va veb-serverni bir vaqtda ishga tushiramiz
+    await asyncio.gather(
+        dp.start_polling(bot),
+        web_server()
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
